@@ -1,5 +1,8 @@
 # Default configuration for arm-softmmu
 
+# STM32F429I-DISCO board: built even with --without-default-devices
+CONFIG_STM32F429DISCOVERY=y
+
 # Uncomment the following lines to disable these optional devices:
 # CONFIG_I2C_DEVICES=n
 # CONFIG_PCI_DEVICES=n

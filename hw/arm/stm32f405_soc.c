@@ -27,6 +27,7 @@
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/arm/stm32f405_soc.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/unimp.h"
 
@@ -51,6 +52,11 @@ static const int timer_irq[] = { 28, 29, 30, 50 };
 static const int spi_irq[] =   { 35, 36, 51, 0, 0, 0 };
 static const int exti_irq[] =  { 6, 7, 8, 9, 10, 23, 23, 23, 23, 23, 40,
                                  40, 40, 40, 40, 40} ;
+static const uint32_t dma_addr[] = { 0x40026000, 0x40026400 };
+static const int dma_irq[2][8] = {
+    { 11, 12, 13, 14, 15, 16, 17, 47 },  /* DMA1 streams 0-7 */
+    { 56, 57, 58, 59, 60, 68, 69, 70 },  /* DMA2 streams 0-7 */
+};
 
 
 static void stm32f405_soc_initfn(Object *obj)
@@ -83,6 +89,13 @@ static void stm32f405_soc_initfn(Object *obj)
     }
 
     object_initialize_child(obj, "exti", &s->exti, TYPE_STM32F4XX_EXTI);
+    object_initialize_child(obj, "fmc", &s->fmc, TYPE_STM32_FMC);
+    object_initialize_child(obj, "rng", &s->rng, TYPE_STM32F4XX_RNG);
+
+    for (i = 0; i < STM_NUM_DMAS; i++) {
+        object_initialize_child(obj, "dma[*]", &s->dma[i],
+                                TYPE_STM32F2XX_DMA);
+    }
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
     s->refclk = qdev_init_clock_in(DEVICE(s), "refclk", NULL, NULL, 0);
@@ -122,19 +135,19 @@ static void stm32f405_soc_realize(DeviceState *dev_soc, Error **errp)
     clock_set_source(s->refclk, s->sysclk);
 
     memory_region_init_rom(&s->flash, OBJECT(dev_soc), "STM32F405.flash",
-                           FLASH_SIZE, &err);
+                           s->flash_size, &err);
     if (err != NULL) {
         error_propagate(errp, err);
         return;
     }
     memory_region_init_alias(&s->flash_alias, OBJECT(dev_soc),
                              "STM32F405.flash.alias", &s->flash, 0,
-                             FLASH_SIZE);
+                             s->flash_size);
 
     memory_region_add_subregion(system_memory, FLASH_BASE_ADDRESS, &s->flash);
     memory_region_add_subregion(system_memory, 0, &s->flash_alias);
 
-    memory_region_init_ram(&s->sram, NULL, "STM32F405.sram", SRAM_SIZE,
+    memory_region_init_ram(&s->sram, NULL, "STM32F405.sram", s->sram_size,
                            &err);
     if (err != NULL) {
         error_propagate(errp, err);
@@ -190,12 +203,19 @@ static void stm32f405_soc_realize(DeviceState *dev_soc, Error **errp)
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, usart_addr[i]);
         sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(armv7m, usart_irq[i]));
+        s->usart[i].mmio_addr = usart_addr[i];
+
+        if (i == 0 || i == 5) {
+            s->usart[i].dma = &s->dma[1];
+        } else {
+            s->usart[i].dma = &s->dma[0];
+        }
     }
 
     /* Timer 2 to 5 */
     for (i = 0; i < STM_NUM_TIMERS; i++) {
         dev = DEVICE(&(s->timer[i]));
-        qdev_prop_set_uint64(dev, "clock-frequency", 1000000000);
+        qdev_prop_set_uint64(dev, "clock-frequency", s->timer_freq_hz);
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer[i]), errp)) {
             return;
         }
@@ -254,6 +274,33 @@ static void stm32f405_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_connect_gpio_out(DEVICE(&s->syscfg), i, qdev_get_gpio_in(dev, i));
     }
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->fmc), errp)) {
+        return;
+    }
+    busdev = SYS_BUS_DEVICE(&s->fmc);
+    sysbus_mmio_map(busdev, 0, 0xA0000000);
+
+    /* RNG shares IRQ 80 (HASH_RNG) with the unmodelled HASH unit */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rng), errp)) {
+        return;
+    }
+    busdev = SYS_BUS_DEVICE(&s->rng);
+    sysbus_mmio_map(busdev, 0, 0x50060800);
+    sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(armv7m, 80));
+
+    for (i = 0; i < STM_NUM_DMAS; i++) {
+        dev = DEVICE(&(s->dma[i]));
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma[i]), errp)) {
+            return;
+        }
+        busdev = SYS_BUS_DEVICE(dev);
+        sysbus_mmio_map(busdev, 0, dma_addr[i]);
+        for (int j = 0; j < 8; j++) {
+            sysbus_connect_irq(busdev, j,
+                               qdev_get_gpio_in(armv7m, dma_irq[i][j]));
+        }
+    }
+
     create_unimplemented_device("timer[7]",    0x40001400, 0x400);
     create_unimplemented_device("timer[12]",   0x40001800, 0x400);
     create_unimplemented_device("timer[6]",    0x40001000, 0x400);
@@ -289,20 +336,26 @@ static void stm32f405_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("CRC",         0x40023000, 0x400);
     create_unimplemented_device("Flash Int",   0x40023C00, 0x400);
     create_unimplemented_device("BKPSRAM",     0x40024000, 0x400);
-    create_unimplemented_device("DMA1",        0x40026000, 0x400);
-    create_unimplemented_device("DMA2",        0x40026400, 0x400);
     create_unimplemented_device("Ethernet",    0x40028000, 0x1400);
     create_unimplemented_device("USB OTG HS",  0x40040000, 0x30000);
     create_unimplemented_device("USB OTG FS",  0x50000000, 0x31000);
     create_unimplemented_device("DCMI",        0x50050000, 0x400);
-    create_unimplemented_device("RNG",         0x50060800, 0x400);
 }
+
+static const Property stm32f405_soc_properties[] = {
+    /* Defaults model the STM32F405; the STM32F429 board overrides them */
+    DEFINE_PROP_UINT32("flash-size", STM32F405State, flash_size, FLASH_SIZE),
+    DEFINE_PROP_UINT32("sram-size", STM32F405State, sram_size, SRAM_SIZE),
+    DEFINE_PROP_UINT64("timer-freq", STM32F405State, timer_freq_hz,
+                       1000000000),
+};
 
 static void stm32f405_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = stm32f405_soc_realize;
+    device_class_set_props(dc, stm32f405_soc_properties);
     /* No vmstate or reset required: device has no internal state */
 }
 

@@ -43,6 +43,12 @@
 #define DB_PRINT(fmt, args...) DB_PRINT_L(1, fmt, ## args)
 
 static void stm32f2xx_timer_set_alarm(STM32F2XXTimerState *s, int64_t now);
+static void stm32f2xx_timer_set_cc1_alarm(STM32F2XXTimerState *s, int64_t now);
+
+static void stm32f2xx_timer_update_irq(STM32F2XXTimerState *s)
+{
+    qemu_set_irq(s->irq, !!(s->tim_sr & s->tim_dier));
+}
 
 static void stm32f2xx_timer_interrupt(void *opaque)
 {
@@ -50,9 +56,9 @@ static void stm32f2xx_timer_interrupt(void *opaque)
 
     DB_PRINT("Interrupt\n");
 
-    if (s->tim_dier & TIM_DIER_UIE && s->tim_cr1 & TIM_CR1_CEN) {
+    if (s->tim_cr1 & TIM_CR1_CEN) {
         s->tim_sr |= 1;
-        qemu_irq_pulse(s->irq);
+        stm32f2xx_timer_update_irq(s);
         stm32f2xx_timer_set_alarm(s,
                                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
@@ -64,6 +70,19 @@ static void stm32f2xx_timer_interrupt(void *opaque)
         /* PWM 2 - Mode 1 */
         DB_PRINT("PWM2 Duty Cycle: %d%%\n",
                 s->tim_ccr2 / (100 * (s->tim_psc + 1)));
+    }
+}
+
+static void stm32f2xx_timer_cc1_interrupt(void *opaque)
+{
+    STM32F2XXTimerState *s = opaque;
+
+    DB_PRINT("CC1 Interrupt\n");
+
+    if (s->tim_cr1 & TIM_CR1_CEN) {
+        /* Set CC1IF (bit 1) in status register */
+        s->tim_sr |= TIM_SR_CC1IF;
+        stm32f2xx_timer_update_irq(s);
     }
 }
 
@@ -111,10 +130,50 @@ static void stm32f2xx_timer_set_alarm(STM32F2XXTimerState *s, int64_t now)
     DB_PRINT("Wait Time: %" PRId64 " ticks\n", hit_time);
 }
 
+static void stm32f2xx_timer_set_cc1_alarm(STM32F2XXTimerState *s, int64_t now)
+{
+    uint32_t counter;
+    uint32_t ticks_to_cc1;
+    int64_t cc1_ns;
+
+    if (!(s->tim_cr1 & TIM_CR1_CEN)) {
+        return;
+    }
+
+    if (!(s->tim_dier & TIM_DIER_CC1IE)) {
+        return;
+    }
+
+    counter = stm32f2xx_timer_get_cnt(s, now);
+
+    ticks_to_cc1 = s->tim_ccr1 - counter;
+
+    if (ticks_to_cc1 == 0 || ticks_to_cc1 > 0x80000000U) {
+        /*
+         * Counter has already reached or passed the compare value.
+         * Fire as soon as possible — this models real hardware where
+         * the comparator triggers immediately when CNT >= CCR1.
+         * Since we only call set_cc1_alarm from the DIER write handler,
+         * CCR1 is guaranteed to be the fresh value from set_next_event.
+         */
+        cc1_ns = now + 1;
+    } else {
+        cc1_ns = now + muldiv64((uint64_t)ticks_to_cc1 * (s->tim_psc + 1),
+                                1000000000ULL, s->freq_hz);
+    }
+
+    timer_mod(s->cc1_timer, cc1_ns);
+}
+
 static void stm32f2xx_timer_reset(DeviceState *dev)
 {
     STM32F2XXTimerState *s = STM32F2XXTIMER(dev);
+
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->cc1_timer) {
+        timer_del(s->cc1_timer);
+    }
 
     s->tim_cr1 = 0;
     s->tim_cr2 = 0;
@@ -231,10 +290,15 @@ static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
         return;
     case TIM_DIER:
         s->tim_dier = value;
+        if (value & TIM_DIER_CC1IE) {
+            stm32f2xx_timer_set_cc1_alarm(s, now);
+        }
+        stm32f2xx_timer_update_irq(s);
         return;
     case TIM_SR:
         /* This is set by hardware and cleared by software */
         s->tim_sr &= value;
+        stm32f2xx_timer_update_irq(s);
         return;
     case TIM_EGR:
         s->tim_egr = value;
@@ -355,6 +419,8 @@ static void stm32f2xx_timer_realize(DeviceState *dev, Error **errp)
 {
     STM32F2XXTimerState *s = STM32F2XXTIMER(dev);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stm32f2xx_timer_interrupt, s);
+    s->cc1_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                stm32f2xx_timer_cc1_interrupt, s);
 }
 
 static void stm32f2xx_timer_class_init(ObjectClass *klass, const void *data)

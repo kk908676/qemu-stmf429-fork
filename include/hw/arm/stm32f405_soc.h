@@ -30,9 +30,12 @@
 #include "hw/timer/stm32f2xx_timer.h"
 #include "hw/char/stm32f2xx_usart.h"
 #include "hw/adc/stm32f2xx_adc.h"
+#include "hw/dma/stm32f2xx_dma.h"
 #include "hw/misc/stm32f4xx_exti.h"
 #include "hw/core/or-irq.h"
 #include "hw/ssi/stm32f2xx_spi.h"
+#include "hw/misc/stm32_fmc.h"
+#include "hw/misc/stm32f4xx_rng.h"
 #include "hw/arm/armv7m.h"
 #include "qom/object.h"
 
@@ -43,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(STM32F405State, STM32F405_SOC)
 #define STM_NUM_TIMERS 4
 #define STM_NUM_ADCS 6
 #define STM_NUM_SPIS 6
+#define STM_NUM_DMAS 2
 
 #define FLASH_BASE_ADDRESS 0x08000000
 #define FLASH_SIZE (1024 * 1024)
@@ -64,6 +68,13 @@ struct STM32F405State {
     OrIRQState adc_irqs;
     STM32F2XXADCState adc[STM_NUM_ADCS];
     STM32F2XXSPIState spi[STM_NUM_SPIS];
+    STM32F2XXDMAState dma[STM_NUM_DMAS];
+    STM32FMCState fmc;
+    STM32F4xxRngState rng;
+
+    uint32_t flash_size;
+    uint32_t sram_size;
+    uint64_t timer_freq_hz;
 
     MemoryRegion ccm;
     MemoryRegion sram;

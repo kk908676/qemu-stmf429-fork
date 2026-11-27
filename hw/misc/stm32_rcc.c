@@ -36,6 +36,18 @@ static void stm32_rcc_reset(DeviceState *dev)
     for (int i = 0; i < STM32_RCC_NREGS; i++) {
         s->regs[i] = 0;
     }
+
+    /*
+     * Non-zero reset values from RM0090 section 7.3.  The PLL dividers
+     * matter: Linux reads PLLI2S/PLLSAI even when the bootloader never
+     * configures them, and warns about a zero divisor if they read as 0.
+     */
+    s->regs[STM32_RCC_CR >> 2] = 0x00000083;          /* HSION, HSIRDY, HSITRIM=16 */
+    s->regs[STM32_RCC_PLL_CFGR >> 2] = 0x24003010;    /* M=16 N=192 P=2 Q=4 */
+    s->regs[STM32_RCC_AHB1_ENR >> 2] = 0x00100000;    /* CCMDATARAMEN */
+    s->regs[STM32_RCC_CSR >> 2] = 0x0E000000;         /* PORRSTF, PINRSTF, BORRSTF */
+    s->regs[STM32_RCC_PLLI2SCFGR >> 2] = 0x24003000;  /* N=192 Q=4 R=2 (F42x) */
+    s->regs[STM32_RCC_PLLSAI_CFGR >> 2] = 0x24003000; /* N=192 Q=4 R=2 */
 }
 
 static uint64_t stm32_rcc_read(void *opaque, hwaddr addr, unsigned int size)
@@ -99,6 +111,7 @@ static void stm32_rcc_write(void *opaque, hwaddr addr,
         value = deposit32(value, 17, 1, extract32(value, 16, 1));
         value = deposit32(value, 25, 1, extract32(value, 24, 1));
         value = deposit32(value, 27, 1, extract32(value, 26, 1));
+        value = deposit32(value, 29, 1, extract32(value, 28, 1)); /* PLLSAI */
         s->regs[addr >> 2] = value;
         return;
     case STM32_RCC_CFGR:
@@ -136,6 +149,22 @@ static void stm32_rcc_write(void *opaque, hwaddr addr,
                 qemu_set_irq(s->enable_irq[irq_offset + i], new_value);
             }
         }
+        return;
+    case STM32_RCC_BDCR:
+        /*
+         * Auto-set LSERDY (bit 1) when LSEON (bit 0) is written.
+         * The clock driver busy-waits up to 5 s for this bit.
+         */
+        s->regs[addr / 4] = value;
+        s->regs[addr / 4] = deposit32(value, 1, 1, extract32(value, 0, 1));
+        return;
+    case STM32_RCC_CSR:
+        /*
+         * Auto-set LSIRDY (bit 1) when LSION (bit 0) is written.
+         * The clock driver busy-waits up to 5 s for this bit.
+         */
+        s->regs[addr / 4] = value;
+        s->regs[addr / 4] = deposit32(value, 1, 1, extract32(value, 0, 1));
         return;
     default:
         qemu_log_mask(
